@@ -1,0 +1,14 @@
+# Secrets -- never commit these
+*.pfx
+*.cer
+*.env
+config.ps1
+
+# Output files -- generated at runtime
+*.log
+*.csv
+*.json
+
+# Windows
+Thumbs.db
+Desktop.ini
