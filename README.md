@@ -90,7 +90,10 @@ To use it:
 3. Update the pReportFolder parameter
 4. Refresh
 ```
+---
+![Executive Summary](images/executive-summary.png)
 
+![Analysis by Site](images/analysis-by-site.png)
 ---
 
 ## Retention policy

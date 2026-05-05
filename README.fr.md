@@ -103,7 +103,11 @@ Pour l'utiliser :
 3. Mettre à jour le paramètre pReportFolder
 4. Refresh
 ```
+---
+## Power BI Report Preview
+![Executive Summary](images/executive-summary.png)
 
+![Analysis by Site](images/analysis-by-site.png)
 ---
 
 ## Politique de rétention
