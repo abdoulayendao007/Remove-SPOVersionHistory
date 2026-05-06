@@ -4,8 +4,10 @@
 
 PowerShell script to automatically clean up file version history across all SharePoint Online sites in your tenant.
 
-> This script is designed as a **governance tool**.
-> It complements SharePoint Intelligent Versioning and Microsoft Purview, but does not replace them.
+> This script is a **storage optimization and governance tool**.
+> It acts on file version history in SharePoint Online and must be used
+> in conjunction with Microsoft retention and compliance policies
+> (SharePoint versioning, Microsoft Purview), not as a replacement.
 
 ---
 
