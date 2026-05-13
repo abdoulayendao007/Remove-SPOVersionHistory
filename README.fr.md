@@ -4,8 +4,11 @@
 
 Script PowerShell pour nettoyer automatiquement l'historique de versions de fichiers sur tous les sites SharePoint Online de votre tenant.
 
-> Ce script est conçu comme un **outil de gouvernance**.
-> Il complète le versioning intelligent de SharePoint et Microsoft Purview, mais ne les remplace pas.
+>Ce script est un **outil d'optimisation et de gouvernance du stockage**.
+> Il agit sur l'historique de versions des fichiers dans SharePoint Online
+> et doit être utilisé en complément des politiques de rétention et de
+> conformité Microsoft (SharePoint versioning, Microsoft Purview),
+> sans les remplacer
 
 ---
 
