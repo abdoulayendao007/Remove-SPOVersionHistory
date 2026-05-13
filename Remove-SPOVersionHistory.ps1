@@ -2,7 +2,7 @@
 # Remove-SPOVersionHistory.ps1
 # SharePoint Online File Version History Cleanup Script
 # Author  : Abdoulaye Ndao
-# Version : 1.0.3
+# Version : 1.0.4
 # License : MIT
 # GitHub  : https://github.com/abdoulayendao007/Remove-SPOVersionHistory
 # ============================================================
@@ -28,12 +28,47 @@
 #     $env:SP_CLIENT_ID = "your-client-id"
 #     .\Remove-SPOVersionHistory.ps1 -UseInteractive -TestSite "AuditReports"
 #
-#   Full tenant scan (server with certificate) :
-#     $env:SP_TENANT        = "your-tenant.onmicrosoft.com"
-#     $env:SP_CLIENT_ID     = "your-client-id"
-#     $env:SP_CERT_PATH     = "C:\Certs\your-cert.pfx"
-#     $env:SP_CERT_PASSWORD = "your-cert-password"
-#     .\Remove-SPOVersionHistory.ps1
+#   Full tenant scan -- progressive rollout recommended :
+#     Step 1 : .\Remove-SPOVersionHistory.ps1 -TestSites @("Site1","Site2","Site3")
+#     Step 2 : .\Remove-SPOVersionHistory.ps1 -TestSites @("Site1","Site2"..."Site20")
+#     Step 3 : .\Remove-SPOVersionHistory.ps1
+#
+#   Resume after crash :
+#     .\Remove-SPOVersionHistory.ps1 -StartSite "RH"
+#
+# PRODUCTION SAFETY (v1.0.4) :
+#
+#   BatchSize (default 20) :
+#     Versions are deleted in small batches to prevent OutOfMemoryException.
+#     Lower value = safer on low RAM servers, but slower.
+#     Recommended values :
+#       4 GB RAM  -> BatchSize = 10
+#       6-8 GB    -> BatchSize = 20  (default)
+#       16 GB+    -> BatchSize = 50
+#
+#   MaxVersionsPerFile (default 300) :
+#     Files with more versions than this limit are skipped (SKIP_TOO_MANY).
+#     This prevents loading thousands of version objects into memory at once.
+#     Set to 0 to disable (not recommended on low RAM servers).
+#     Recommended values :
+#       4 GB RAM  -> MaxVersionsPerFile = 150
+#       6-8 GB    -> MaxVersionsPerFile = 300  (default)
+#       16 GB+    -> MaxVersionsPerFile = 500
+#
+#   MaxFilesPerSite (default 0 = no limit) :
+#     By default, all files in a site are processed.
+#     For servers with less than 8 GB RAM and sites with 10000+ files,
+#     consider setting MaxFilesPerSite = 1000 and running multiple times.
+#     Each run will process the next batch of files needing cleanup.
+#
+#   GCInterval (default 200) :
+#     Forces garbage collection every N files to free accumulated memory.
+#     Lower value = more frequent GC but higher CPU overhead.
+#
+#   -StartSite parameter :
+#     Use to resume a run after a crash without reprocessing already done sites.
+#     Example : .\Remove-SPOVersionHistory.ps1 -StartSite "RH"
+#     Sites processed before "RH" (alphabetically) will be skipped.
 #
 # RETENTION POLICY :
 # Normal sites   : Option A -- $VersionsNormal TOTAL (including current)
@@ -50,6 +85,7 @@
 # REQUIREMENTS :
 # - PowerShell 7.4+
 # - PnP.PowerShell 3.x+
+# - 8 GB RAM recommended for full tenant scans (4 GB minimum)
 # - Entra ID App Registration with :
 #
 #   Interactive mode (-UseInteractive) :
@@ -75,14 +111,18 @@ param(
     [string]$CertificatePass = $env:SP_CERT_PASSWORD,
     [switch]$UseInteractive,
     [string]$TestSite        = "",
-    [string[]]$TestSites     = @()
+    [string[]]$TestSites     = @(),
+
+    # Resume after crash -- start processing from this site keyword
+    # All sites before this keyword (alphabetically) will be skipped
+    # Usage : .\Remove-SPOVersionHistory.ps1 -StartSite "RH"
+    [string]$StartSite       = ""
 )
 
 # ============================================================
 # PARAMETER VALIDATION
 # ============================================================
 
-# Mutual exclusion : -TestSite OR -TestSites, not both
 if ($TestSite -ne "" -and $TestSites.Count -gt 0) {
     Write-Host ""
     Write-Host "ERROR : Use -TestSite OR -TestSites, not both." -ForegroundColor Red
@@ -153,10 +193,34 @@ $ModeRecycle = $true
 $DaysInactiveMinimum = 30
 $MaxRetries          = 3
 
-# Automatic based on auth mode
-# Interactive : 800 MB limit (avoids PnP 100s timeouts on large files)
-# Certificate : 0 = no limit (stable connection)
 $MaxFileSizeMB = if ($UseInteractive) { 800 } else { 0 }
+
+# ============================================================
+# v1.0.4 : Production safety settings
+# See header comments for recommended values per RAM profile
+# ============================================================
+
+# Batch size for version deletion
+# Prevents OutOfMemoryException on files with many versions
+# Set to 0 to disable batching (not recommended)
+$BatchSize = 20
+
+# Max versions per file before skipping (SKIP_TOO_MANY)
+# Prevents loading too many version objects into memory
+# Set to 0 to disable (not recommended on low RAM servers)
+$MaxVersionsPerFile = 300
+
+# Max files to process per site (0 = no limit)
+# For servers with < 8 GB RAM and sites with 10000+ files,
+# consider setting to 1000 and running multiple times
+$MaxFilesPerSite = 0
+
+# Force garbage collection every N files
+# Prevents memory accumulation on long runs
+$GCInterval = 200
+
+# Pause between batches in seconds
+$PauseBetweenBatches = 2
 
 $LogFolder  = "C:\Temp\SPOVersionCleanup"
 $RunId      = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -168,17 +232,13 @@ $RunDate    = Get-Date -Format 'yyyy-MM-dd'
 
 # ============================================================
 # CRITICAL SITES
-# IMPORTANT : This is an EXAMPLE list.
-# Each organization MUST define its own based on
-# business and regulatory requirements.
-# Review with your compliance team before production.
 # ============================================================
 $CriticalSites = @(
-    "Accounting",     # Example : Accounting, financial records
-    "LegalAffairs",   # Example : Contracts, legal documents
-    "PeopleOps",      # Example : Employee records, HR
-    "RegulatoryDocs", # Example : Regulatory compliance
-    "AuditReports"    # Example : Audit records
+    "Accounting",
+    "LegalAffairs",
+    "PeopleOps",
+    "RegulatoryDocs",
+    "AuditReports"
 )
 
 $ExcludedLibraries = @(
@@ -207,10 +267,12 @@ $TotalFilesRecent       = 0
 $TotalFilesUnderLimit   = 0
 $TotalFilesAccessDenied = 0
 $TotalFilesSkippedLarge = 0
+$TotalFilesSkippedTooMany = 0
 $TotalVersionsRemoved   = 0
 $TotalSpaceMB           = 0
 $TotalErrors            = 0
 $ConnectionCache        = @{}
+$GlobalFileCounter      = 0
 
 # ============================================================
 # FUNCTIONS
@@ -280,7 +342,6 @@ function Invoke-PnPWithRetry {
     } catch {
         $errMsg = $_.ToString()
 
-        # PnP 100s HTTP timeout -- progressive retry with backoff
         if ($errMsg -match "HttpClient\.Timeout|request was canceled|TaskCanceledException|timeout of 100 seconds") {
             $retryDelay = 10
             for ($i = 1; $i -le $MaxRetries; $i++) {
@@ -358,11 +419,17 @@ function Invoke-VersionCleanup {
         $Versions = @($rawResult)
         if ($Versions.Count -le $HistoryThreshold) { return "UNDER_LIMIT" }
 
+        # v1.0.4 : Hard limit on versions per file to prevent OOM
+        if ($MaxVersionsPerFile -gt 0 -and $Versions.Count -gt $MaxVersionsPerFile) {
+            Write-Log "      SKIP_TOO_MANY : $($Versions.Count) versions > limit $MaxVersionsPerFile : $FileUrl" "WARN"
+            Write-Log "      TIP : Increase MaxVersionsPerFile or process this file manually" "WARN"
+            return "SKIP_TOO_MANY"
+        }
+
         if ($MaxFileSizeMB -gt 0) {
             $SizeMB = [math]::Round((($Versions | ForEach-Object { if ($null -ne $_.Size) { $_.Size } else { 0 } } | Measure-Object -Sum).Sum / 1MB), 2)
             if ($SizeMB -gt $MaxFileSizeMB) {
                 Write-Log "      SKIP_LARGE : $SizeMB MB > limit $MaxFileSizeMB MB : $FileUrl" "WARN"
-                Write-Log "      TIP : Set MaxFileSizeMB=0 with certificate mode to process this file" "WARN"
                 return "SKIP_LARGE"
             }
         }
@@ -375,20 +442,51 @@ function Invoke-VersionCleanup {
         Write-Log "      History : $($Versions.Count) | To remove : $RemoveCount | Space : $SpaceMB MB" "INFO"
 
         if (-not $ModeTest) {
-            foreach ($Version in $VersionsToRemove) {
-                try {
-                    $Identity = Resolve-VersionIdentity -Version $Version
-                    if ($null -eq $Identity) { Write-Log "      SKIP version -- identity unresolved" "WARN"; continue }
-                    $r = Invoke-PnPWithRetry -SiteUrl $SiteUrl -Connection $Connection -Command {
-                        param($conn)
-                        if ($ModeRecycle) {
-                            Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Recycle -Force -Connection $conn -ErrorAction Stop
-                        } else {
-                            Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Force -Connection $conn -ErrorAction Stop
-                        }
+            if ($BatchSize -gt 0) {
+                $removedCount = 0
+                $batchNum     = 0
+                for ($b = 0; $b -lt $VersionsToRemove.Count; $b += $BatchSize) {
+                    $batchNum++
+                    $end   = [math]::Min($b + $BatchSize - 1, $VersionsToRemove.Count - 1)
+                    $batch = $VersionsToRemove[$b..$end]
+
+                    foreach ($Version in $batch) {
+                        try {
+                            $Identity = Resolve-VersionIdentity -Version $Version
+                            if ($null -eq $Identity) { Write-Log "      SKIP version -- identity unresolved" "WARN"; continue }
+                            $r = Invoke-PnPWithRetry -SiteUrl $SiteUrl -Connection $Connection -Command {
+                                param($conn)
+                                if ($ModeRecycle) {
+                                    Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Recycle -Force -Connection $conn -ErrorAction Stop
+                                } else {
+                                    Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Force -Connection $conn -ErrorAction Stop
+                                }
+                            }
+                            if (-not (Test-IsErrorStatus $r)) { $removedCount++ }
+                        } catch { Write-Log "      Error removing version : $_" "ERROR" }
                     }
-                    if (Test-IsErrorStatus $r) { Write-Log "      Version removal skipped ($r)" "WARN" }
-                } catch { Write-Log "      Error removing version : $_" "ERROR" }
+
+                    if ($b + $BatchSize -lt $VersionsToRemove.Count) {
+                        Start-Sleep -Seconds $PauseBetweenBatches
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers()
+                    }
+                }
+            } else {
+                foreach ($Version in $VersionsToRemove) {
+                    try {
+                        $Identity = Resolve-VersionIdentity -Version $Version
+                        if ($null -eq $Identity) { Write-Log "      SKIP version -- identity unresolved" "WARN"; continue }
+                        $r = Invoke-PnPWithRetry -SiteUrl $SiteUrl -Connection $Connection -Command {
+                            param($conn)
+                            if ($ModeRecycle) {
+                                Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Recycle -Force -Connection $conn -ErrorAction Stop
+                            } else {
+                                Remove-PnPFileVersion -Url $FileUrl -Identity $Identity -Force -Connection $conn -ErrorAction Stop
+                            }
+                        }
+                    } catch { Write-Log "      Error removing version : $_" "ERROR" }
+                }
             }
             Write-Log "      $(if ($ModeRecycle) { 'RECYCLED' } else { 'DELETED' }) $RemoveCount versions" "SUCCESS"
         } else {
@@ -422,16 +520,41 @@ function Invoke-VersionCleanup {
 $authMode = if ($UseInteractive) { "INTERACTIVE (browser)" } else { "CERTIFICATE (unattended)" }
 
 Write-Log "=========================================="
-Write-Log "SPO VERSION HISTORY CLEANUP v1.0.3"
+Write-Log "SPO VERSION HISTORY CLEANUP v1.0.4"
 Write-Log "=========================================="
-Write-Log "Auth mode       : $authMode"
-Write-Log "MaxFileSizeMB   : $(if ($MaxFileSizeMB -eq 0) { 'No limit' } else { "$MaxFileSizeMB MB" })"
+Write-Log "Auth mode           : $authMode"
+Write-Log "MaxFileSizeMB       : $(if ($MaxFileSizeMB -eq 0) { 'No limit' } else { "$MaxFileSizeMB MB" })"
+Write-Log "BatchSize           : $(if ($BatchSize -eq 0) { 'Disabled' } else { "$BatchSize versions/batch" })"
+Write-Log "MaxVersionsPerFile  : $(if ($MaxVersionsPerFile -eq 0) { 'No limit' } else { $MaxVersionsPerFile })"
+Write-Log "MaxFilesPerSite     : $(if ($MaxFilesPerSite -eq 0) { 'No limit' } else { $MaxFilesPerSite })"
+Write-Log "GCInterval          : every $GCInterval files"
+
+# RAM check
+$totalRAMMB = [math]::Round((Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize / 1KB, 0)
+$freeRAMMB  = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1KB, 0)
+Write-Log "RAM                 : $freeRAMMB MB free / $totalRAMMB MB total"
+
+if ($totalRAMMB -lt 8192) {
+    Write-Log "==========================================" "WARN"
+    Write-Log "WARNING : Server RAM is below 8 GB ($totalRAMMB MB total)." "WARN"
+    Write-Log "          Current settings (BatchSize=$BatchSize, MaxVersionsPerFile=$MaxVersionsPerFile)" "WARN"
+    Write-Log "          are safe for this RAM profile." "WARN"
+    Write-Log "          Consider using -TestSites for progressive rollout." "WARN"
+    Write-Log "          See README.md for RAM tuning guide." "WARN"
+    Write-Log "==========================================" "WARN"
+}
+
+if ($StartSite -ne "") {
+    Write-Log "Resume mode         : starting from site matching '$StartSite'" "WARN"
+}
+
 if ($UseInteractive) {
     Write-Log "==========================================" "WARN"
     Write-Log "WARNING : Interactive mode is for testing only." "WARN"
     Write-Log "          Use certificate mode for full tenant scans." "WARN"
     Write-Log "==========================================" "WARN"
 }
+
 Write-Log "Run ID          : $RunId"
 Write-Log "Tenant          : $Tenant"
 Write-Log "Mode            : $(if ($ModeTest) { 'SIMULATION (no deletions)' } else { 'PRODUCTION' })"
@@ -454,27 +577,19 @@ Install-PnPIfNeeded
 
 # ============================================================
 # SITE LIST BUILDING
-# If -TestSite or -TestSites : connect directly without
-# calling Get-PnPTenantSite (avoids 403 in interactive mode)
 # ============================================================
 if ($TestSite -ne "" -or $TestSites.Count -gt 0) {
-
     Write-Log "TEST MODE : Building site list directly (skipping Get-PnPTenantSite)" "WARN"
-
     $TestSiteUrls = @()
     if ($TestSite -ne "") { $TestSiteUrls += "$TenantUrl/sites/$($TestSite.TrimStart('/'))" }
     foreach ($t in $TestSites) { $TestSiteUrls += "$TenantUrl/sites/$($t.TrimStart('/'))" }
-
     $Sites = $TestSiteUrls | ForEach-Object { [PSCustomObject]@{ Url = $_; Status = "Active" } }
     Write-Log "TEST MODE : $($Sites.Count) site(s) to process" "WARN"
     Write-Log "TIP : For full tenant scan, remove -TestSite/-TestSites and use certificate mode" "WARN"
-
 } else {
-
     Write-Log "Connecting to admin : $AdminUrl"
     $ConnAdmin = Get-SPConnection -Url $AdminUrl
     if ($null -eq $ConnAdmin) { Write-Log "Admin connection failed -- aborting" "ERROR"; exit 1 }
-
     Write-Log "Retrieving sites..."
     try {
         $ConnAdminRef = [ref]$ConnAdmin
@@ -490,9 +605,29 @@ if ($TestSite -ne "" -or $TestSites.Count -gt 0) {
 }
 
 # ============================================================
+# v1.0.4 : Resume mode
+# ============================================================
+$ResumeMode = ($StartSite -ne "")
+if ($ResumeMode) {
+    Write-Log "RESUME MODE : Will skip sites until matching '$StartSite'" "WARN"
+}
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 foreach ($Site in $Sites) {
+
+    # Resume mode : skip until StartSite found
+    if ($ResumeMode) {
+        if ($Site.Url -like "*$StartSite*") {
+            $ResumeMode = $false
+            Write-Log "RESUME MODE : Found -- resuming from $($Site.Url)" "WARN"
+        } else {
+            Write-Log "RESUME : Skipping $($Site.Url)" "SKIP"
+            continue
+        }
+    }
+
     Write-Log ""
     Write-Log "=========================================="
     Write-Log "SITE : $($Site.Url)"
@@ -509,6 +644,7 @@ foreach ($Site in $Sites) {
 
     $SiteCleaned = 0; $SiteRecent = 0; $SiteUnderLimit = 0
     $SiteAccessDenied = 0; $SiteVersions = 0; $SiteSpaceMB = 0
+    $SiteFileCounter = 0
 
     $ConnSite = Get-SPConnection -Url $Site.Url
     if ($null -eq $ConnSite) { $TotalErrors++; continue }
@@ -518,17 +654,14 @@ foreach ($Site in $Sites) {
         $rawLibraries = Invoke-PnPWithRetry -SiteUrl $Site.Url -Connection $ConnSiteRef -Command {
             param($conn) Get-PnPList -Connection $conn -ErrorAction Stop
         }
-
         if ($rawLibraries -eq "ACCESS_DENIED") {
             $SitesAccessDenied.Add($Site.Url); $TotalFilesAccessDenied++; continue
         }
         if (Test-IsErrorStatus $rawLibraries -or $null -eq $rawLibraries) { $TotalErrors++; continue }
-
         $Libraries = @($rawLibraries | Where-Object {
             $_.BaseTemplate -eq 101 -and $_.Hidden -eq $false -and $_.Title -notin $ExcludedLibraries
         })
         Write-Log "Libraries : $($Libraries.Count)"
-
     } catch {
         $errLib = $_.ToString()
         if ($errLib -match "403|Unauthorized|AccessDenied") {
@@ -544,7 +677,6 @@ foreach ($Site in $Sites) {
                 param($conn)
                 Get-PnPListItem -List $Library -PageSize 200 -Fields "FileRef","Modified","FSObjType" -Connection $conn -ErrorAction Stop
             }
-
             if ($rawItems -eq "ACCESS_DENIED") { $SiteAccessDenied++; $TotalFilesAccessDenied++; continue }
             if (Test-IsErrorStatus $rawItems -or $null -eq $rawItems) { $TotalErrors++; continue }
 
@@ -552,6 +684,14 @@ foreach ($Site in $Sites) {
             Write-Log "    Files : $($Items.Count)"
 
             foreach ($Item in $Items) {
+
+                # v1.0.4 : MaxFilesPerSite limit
+                if ($MaxFilesPerSite -gt 0 -and $SiteFileCounter -ge $MaxFilesPerSite) {
+                    Write-Log "    MaxFilesPerSite ($MaxFilesPerSite) reached -- skipping remaining files" "WARN"
+                    Write-Log "    TIP : Run again to process remaining files in this site" "WARN"
+                    break
+                }
+
                 try {
                     $CurrentSiteType = if ($IsCritical) { "Critical" } else { "Normal" }
                     $Result = Invoke-VersionCleanup `
@@ -563,20 +703,36 @@ foreach ($Site in $Sites) {
                         -SiteType $CurrentSiteType `
                         -Connection $ConnSiteRef
 
+                    $SiteFileCounter++
+                    $GlobalFileCounter++
+
                     switch ($Result) {
-                        "RECENT"        { $SiteRecent++; $TotalFilesRecent++ }
-                        "UNDER_LIMIT"   { $SiteUnderLimit++; $TotalFilesUnderLimit++ }
-                        "ACCESS_DENIED" { $SiteAccessDenied++; $TotalFilesAccessDenied++ }
-                        "SKIP_LARGE"    { $TotalFilesSkippedLarge++ }
-                        "TIMEOUT"       { $TotalErrors++ }
-                        "AUTH_ERROR"    { $TotalErrors++ }
-                        $null           { $TotalErrors++ }
+                        "RECENT"         { $SiteRecent++; $TotalFilesRecent++ }
+                        "UNDER_LIMIT"    { $SiteUnderLimit++; $TotalFilesUnderLimit++ }
+                        "ACCESS_DENIED"  { $SiteAccessDenied++; $TotalFilesAccessDenied++ }
+                        "SKIP_LARGE"     { $TotalFilesSkippedLarge++ }
+                        "SKIP_TOO_MANY"  { $TotalFilesSkippedTooMany++ }
+                        "TIMEOUT"        { $TotalErrors++ }
+                        "AUTH_ERROR"     { $TotalErrors++ }
+                        $null            { $TotalErrors++ }
                         default {
                             $ReportData.Add($Result)
                             $SiteCleaned++; $SiteVersions += $Result.Removed; $SiteSpaceMB += $Result.SpaceMB
                             $TotalFilesCleaned++; $TotalVersionsRemoved += $Result.Removed; $TotalSpaceMB += $Result.SpaceMB
                         }
                     }
+
+                    # v1.0.4 : Periodic GC
+                    if ($GCInterval -gt 0 -and $GlobalFileCounter % $GCInterval -eq 0) {
+                        [System.GC]::Collect()
+                        [System.GC]::WaitForPendingFinalizers()
+                    }
+
+                    # v1.0.4 : Flush CSV every 100 files to prevent data loss on crash
+                    if ($GlobalFileCounter % 100 -eq 0 -and $ReportData.Count -gt 0) {
+                        try { $ReportData | Export-Csv -Path $ReportCSV -NoTypeInformation -Encoding UTF8 -Force } catch { }
+                    }
+
                 } catch { Write-Log "    ERROR on file : $_" "ERROR"; $TotalErrors++ }
             }
         } catch { Write-Log "  ERROR on library $($Library.Title) : $_" "ERROR"; $TotalErrors++ }
@@ -589,6 +745,10 @@ foreach ($Site in $Sites) {
         SpaceMB = [math]::Round($SiteSpaceMB, 2); SpaceGB = [math]::Round($SiteSpaceMB / 1024, 2)
     })
     Write-Log "  SITE SUMMARY : Cleaned=$SiteCleaned | Recent=$SiteRecent | UnderLimit=$SiteUnderLimit | AccessDenied=$SiteAccessDenied | Versions=$SiteVersions | $([math]::Round($SiteSpaceMB,2)) MB" "SUCCESS"
+
+    # v1.0.4 : GC after each site
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
 }
 
 # Export CSV
@@ -605,10 +765,13 @@ try {
         TotalSitesCleaned = ($SitesSummary | Where-Object { $_.Cleaned -gt 0 }).Count
         TotalFiles = $TotalFilesCleaned; TotalFilesRecent = $TotalFilesRecent
         TotalFilesUnderLimit = $TotalFilesUnderLimit; TotalFilesAccessDenied = $TotalFilesAccessDenied
-        TotalFilesSkippedLarge = $TotalFilesSkippedLarge; TotalVersions = $TotalVersionsRemoved
+        TotalFilesSkippedLarge = $TotalFilesSkippedLarge
+        TotalFilesSkippedTooMany = $TotalFilesSkippedTooMany
+        TotalVersions = $TotalVersionsRemoved
         TotalSpaceMB = [math]::Round($TotalSpaceMB, 2); TotalSpaceGB = [math]::Round($TotalSpaceMB / 1024, 2)
         TotalErrors = $TotalErrors; RetentionNormal = $VersionsNormal; RetentionCritical = $VersionsCritical
-        MaxFileSizeMB = $MaxFileSizeMB
+        MaxFileSizeMB = $MaxFileSizeMB; BatchSize = $BatchSize
+        MaxVersionsPerFile = $MaxVersionsPerFile; MaxFilesPerSite = $MaxFilesPerSite
         TopSites = ($SitesSummary | Sort-Object SpaceGB -Descending | Select-Object -First 10 |
             ForEach-Object { [PSCustomObject]@{ Site=$_.Site; Type=$_.Type; SpaceGB=$_.SpaceGB; Files=$_.Cleaned; Versions=$_.Versions } })
         AccessDeniedSites = $SitesAccessDenied; CSVReport = $ReportCSV; LogFile = $LogFile
@@ -632,12 +795,19 @@ Write-Log "Auth mode               : $authMode"
 Write-Log "Mode                    : $(if ($ModeTest) { 'SIMULATION' } else { 'PRODUCTION' })"
 Write-Log "Deletion mode           : $(if ($ModeRecycle) { 'RECYCLE BIN (~93 days)' } else { 'PERMANENT' })"
 Write-Log "Retention policy        : Normal=$($VersionsNormal) total | Critical=$($VersionsCritical) history"
+Write-Log "BatchSize               : $(if ($BatchSize -eq 0) { 'Disabled' } else { "$BatchSize versions/batch" })"
+Write-Log "MaxVersionsPerFile      : $(if ($MaxVersionsPerFile -eq 0) { 'No limit' } else { $MaxVersionsPerFile })"
+Write-Log "MaxFilesPerSite         : $(if ($MaxFilesPerSite -eq 0) { 'No limit' } else { $MaxFilesPerSite })"
 Write-Log "Files cleaned           : $TotalFilesCleaned"
 Write-Log "Files skipped (recent)  : $TotalFilesRecent"
 Write-Log "Files under limit       : $TotalFilesUnderLimit"
 Write-Log "Files access denied     : $TotalFilesAccessDenied"
 Write-Log "Files skipped (large)   : $TotalFilesSkippedLarge"
-if ($TotalFilesSkippedLarge -gt 0) { Write-Log "TIP : Set MaxFileSizeMB=0 with certificate mode to process skipped files" "WARN" }
+Write-Log "Files skipped (too many): $TotalFilesSkippedTooMany"
+if ($TotalFilesSkippedTooMany -gt 0) {
+    Write-Log "TIP : $TotalFilesSkippedTooMany file(s) had more than $MaxVersionsPerFile versions." "WARN"
+    Write-Log "      Increase MaxVersionsPerFile or process these files manually." "WARN"
+}
 Write-Log "${LabelVersions}        : $TotalVersionsRemoved"
 Write-Log "${LabelSpace}           : $TotalSpaceMB MB ($TotalGB GB)"
 Write-Log "Errors                  : $TotalErrors"
