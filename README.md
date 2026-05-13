@@ -384,6 +384,61 @@ Skipped files appear in the logs:
 
 ---
 
+## Production safety settings (v1.0.4)
+
+These parameters are configured in the script and can be adjusted
+based on your environment.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `BatchSize` | 20 | Versions deleted per batch. Lower on servers with < 8 GB RAM |
+| `MaxVersionsPerFile` | 300 | Files with more versions are skipped (SKIP_TOO_MANY) |
+| `MaxFilesPerSite` | 0 | Per-site file limit. 0 = no limit |
+| `GCInterval` | 200 | Garbage collection every N files |
+| `PauseBetweenBatches` | 2s | Pause between deletion batches |
+
+---
+
+### Recommended values per RAM profile
+
+| Server RAM | BatchSize | MaxVersionsPerFile | MaxFilesPerSite |
+|------------|-----------|--------------------|-----------------|
+| 4 GB       | 10        | 150                | 1000            |
+| 6-8 GB     | 20        | 300                | 0               |
+| 16 GB+     | 50        | 500                | 0               |
+
+---
+
+### Resume after crash (-StartSite)
+
+If the script is interrupted mid-run, use `-StartSite`
+to resume without reprocessing already completed sites:
+
+```powershell
+# Resume from site "ROH"
+.\Remove-SPOVersionHistory.ps1 -StartSite "ROH"
+```
+
+Sites processed before "ROH" (alphabetically) will be skipped automatically.
+
+---
+### Files with too many versions (SKIP_TOO_MANY)
+
+Files exceeding `MaxVersionsPerFile` are skipped to prevent OutOfMemoryException.
+They appear in the logs:
+
+```
+[WARN] SKIP_TOO_MANY : 450 versions > limit 300 : /sites/ROH/Documents/files54.xlsx
+[WARN] TIP : Increase MaxVersionsPerFile or process this file manually
+```
+
+To process them, increase `MaxVersionsPerFile` in the script:
+```powershell
+$MaxVersionsPerFile = 500  # if your server RAM allows it
+```
+
+---
+
 ## Verifying freed space after recycle bin
 
 > ⚠️ **Important**: Recycle bin mode does NOT free space immediately.
@@ -454,6 +509,17 @@ It does **not** replace Microsoft Purview retention labels or records management
 ---
 
 ## Changelog
+
+### v1.0.4
+- NEW : `BatchSize` (default 20): version deletion in small batches to prevent OutOfMemoryException
+- NEW : `MaxVersionsPerFile` (default 300): auto-skip files with too many versions (SKIP_TOO_MANY)
+- NEW : `MaxFilesPerSite` (default 0): optional per-site limit for low RAM servers
+- NEW : `GCInterval` (default 200): periodic garbage collection to free accumulated memory
+- NEW : `-StartSite`: resume an interrupted run without reprocessing already done sites
+- NEW : RAM check at startup with warning if below 8 GB
+- NEW : CSV flush every 100 files to prevent data loss on crash
+- NEW : `TotalFilesSkippedTooMany` in JSON summary and logs
+- NEW : `BatchSize`, `MaxVersionsPerFile`, `MaxFilesPerSite` in JSON summary
 
 ### v1.0.3
 - NEW : Mutual exclusion validation for `-TestSite` vs `-TestSites`

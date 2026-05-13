@@ -108,6 +108,7 @@ Pour l'utiliser :
 ![Executive Summary](images/executive-summary.png)
 
 ![Analysis by Site](images/analysis-by-site.png)
+
 ---
 
 ## Politique de rétention
@@ -420,6 +421,61 @@ Les fichiers skippés apparaissent dans les logs :
 
 ---
 
+## Paramètres de sécurité production (v1.0.4)
+
+Ces paramètres sont configurés dans le script et peuvent être ajustés
+selon votre environnement.
+
+| Paramètre | Défaut | Description |
+|---|---|---|
+| `BatchSize` | 20 | Versions supprimées par groupe. Réduire sur serveurs < 8 GB RAM |
+| `MaxVersionsPerFile` | 300 | Fichiers avec plus de versions sont skippés (SKIP_TOO_MANY) |
+| `MaxFilesPerSite` | 0 | Limite par site. 0 = pas de limite |
+| `GCInterval` | 200 | Garbage collection tous les N fichiers |
+| `PauseBetweenBatches` | 2s | Pause entre chaque batch de suppression |
+
+---
+
+### Recommandations selon la RAM
+
+| RAM serveur | BatchSize | MaxVersionsPerFile | MaxFilesPerSite |
+|-------------|-----------|--------------------|-----------------|
+| 4 GB        | 10        | 150                | 1000            |
+| 6-8 GB      | 20        | 300                | 0               |
+| 16 GB+      | 50        | 500                | 0               |
+
+---
+
+### Reprendre après un crash (-StartSite)
+
+Si le script s'interrompt en cours de run, utilisez `-StartSite`
+pour reprendre sans retraiter les sites déjà faits :
+
+```powershell
+# Ex:Reprendre depuis le site "ROH"
+.\Remove-SPOVersionHistory.ps1 -StartSite "ROH"
+```
+
+Les sites traités avant "ROH" (alphabétiquement) seront skippés automatiquement.
+
+---
+
+### Fichiers avec trop de versions (SKIP_TOO_MANY)
+
+Les fichiers avec plus de `MaxVersionsPerFile` versions sont skippés
+pour éviter les OutOfMemoryException. Ils apparaissent dans les logs :
+
+```
+[WARN] SKIP_TOO_MANY : 450 versions > limit 300 : /sites/ROH/Documents/files54.xlsx
+[WARN] TIP : Increase MaxVersionsPerFile or process this file manually
+```
+
+Pour les traiter, augmentez `MaxVersionsPerFile` dans le script :
+```powershell
+$MaxVersionsPerFile = 500  # si votre RAM le permet
+```
+---
+
 ## Vérifier l'espace libéré après le recycle bin
 
 > ⚠️ **Important** : Le mode corbeille ne libère PAS l'espace immédiatement.
@@ -429,6 +485,8 @@ L'espace est réellement libéré quand la corbeille est vidée manuellement, ap
 
 > Après avoir vidé la corbeille, l'espace peut prendre **24-48 heures**
 > pour se mettre à jour dans le SharePoint Admin Center.
+
+---
 
 **3 façons de vérifier l'espace libéré :**
 
@@ -497,6 +555,17 @@ Il ne **remplace pas** les étiquettes de rétention Microsoft Purview ni la ges
 ---
 
 ## Changelog
+
+### v1.0.4
+- NEW : `BatchSize` (défaut 20) : suppression par groupes pour éviter OutOfMemoryException
+- NEW : `MaxVersionsPerFile` (défaut 300) : skip automatique des fichiers avec trop de versions (SKIP_TOO_MANY)
+- NEW : `MaxFilesPerSite` (défaut 0) : limite optionnelle par site pour les serveurs avec peu de RAM
+- NEW : `GCInterval` (défaut 200) : garbage collection périodique pour libérer la mémoire
+- NEW : `-StartSite` : reprendre un run interrompu sans retraiter les sites déjà faits
+- NEW : Vérification RAM au démarrage avec warning si < 8 GB
+- NEW : Flush CSV tous les 100 fichiers pour éviter la perte de données en cas de crash
+- NEW : `TotalFilesSkippedTooMany` dans le résumé JSON et les logs
+- NEW : `BatchSize`, `MaxVersionsPerFile`, `MaxFilesPerSite` dans le résumé JSON
 
 ### v1.0.3
 - NEW : Validation mutuelle `-TestSite` vs `-TestSites` (pas les deux simultanément)
